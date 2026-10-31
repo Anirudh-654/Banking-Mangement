@@ -17,7 +17,7 @@ typedef enum {
     OP_ADD_CUSTOMER, OP_MODIFY_USER, OP_LOAN_DECISION, OP_LIST_ASSIGNED_LOANS,
     OP_CUSTOMER_HISTORY, OP_ACCOUNT_STATE, OP_ASSIGN_LOAN, OP_LIST_FEEDBACK,
     OP_ADD_EMPLOYEE, OP_SET_ROLE, OP_CLOSE_ACCOUNT, OP_LIST_PENDING_LOANS,
-    OP_LIST_MY_LOANS, OP_EXIT
+    OP_LIST_MY_LOANS, OP_LIST_EMPLOYEES, OP_ADD_MANAGER, OP_EXIT
 } Operation;
 
 typedef struct {
@@ -93,5 +93,15 @@ typedef struct {
     double amount;
     double balance_before;
 } LoanJournal;
+
+/* Journal for a single-account balance mutation (deposit or withdrawal). */
+typedef struct {
+    int32_t state;       /* 1 prepared, 2 committed, 3 rolled back */
+    int64_t epoch;
+    char customer[MAX_USERNAME];
+    char kind[24];
+    double amount;
+    double balance_before;
+} BalanceJournal;
 
 #endif

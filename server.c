@@ -25,9 +25,12 @@
 #define JOURNAL_FILE "journal.log"
 #define TRANSFER_JOURNAL_FILE "transfer_journal.dat"
 #define LOAN_JOURNAL_FILE "loan_journal.dat"
+#define BALANCE_JOURNAL_FILE "balance_journal.dat"
 
 static char data_dir[256] = "data";
 static sem_t *write_gate;
+/* fcntl locks are process-scoped; this also serializes conflicting server threads. */
+static pthread_mutex_t loan_assignment_gate = PTHREAD_MUTEX_INITIALIZER;
 
 static int send_all(int fd, const void *buf, size_t n) {
     const char *p = buf; ssize_t w;
@@ -42,6 +45,11 @@ static int recv_all(int fd, void *buf, size_t n) {
 static void path_for(char out[512], const char *file) { snprintf(out, 512, "%s/%s", data_dir, file); }
 static int lock_file(int fd, short type) {
     struct flock l = { .l_type = type, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+    return fcntl(fd, F_SETLKW, &l);
+}
+/* Byte-range locks let a future multi-process server lock one fixed-size record. */
+static int lock_record(int fd, short type, off_t start, off_t length) {
+    struct flock l = { .l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = length };
     return fcntl(fd, F_SETLKW, &l);
 }
 static void unlock_file(int fd) { struct flock l = { .l_type = F_UNLCK, .l_whence = SEEK_SET }; (void)fcntl(fd, F_SETLK, &l); }
@@ -129,6 +137,35 @@ static int write_loan_journal(LoanJournal *entry, int state) {
     close(fd);
     return good ? 0 : -1;
 }
+static int write_balance_journal(BalanceJournal *entry, int state) {
+    int fd = db_open(BALANCE_JOURNAL_FILE, O_RDWR|O_CREAT), good = 0;
+    if (fd < 0) return -1;
+    if (lock_file(fd, F_WRLCK) == 0) {
+        entry->state = state;
+        good = write_at(fd, 0, entry, sizeof *entry) && ftruncate(fd, sizeof *entry) == 0 && fsync(fd) == 0;
+        unlock_file(fd);
+    }
+    close(fd);
+    return good ? 0 : -1;
+}
+static void recover_prepared_balance_change(void) {
+    int jfd = db_open(BALANCE_JOURNAL_FILE, O_RDWR|O_CREAT), ufd;
+    BalanceJournal entry; User customer; off_t pos;
+    if (jfd < 0 || lock_file(jfd, F_WRLCK) < 0) { if (jfd >= 0) close(jfd); return; }
+    if (read_at(jfd, 0, &entry, sizeof entry) && entry.state == 1) {
+        ufd = db_open(USERS_FILE, O_RDWR);
+        if (ufd >= 0 && lock_file(ufd, F_WRLCK) == 0) {
+            if (find_user_fd(ufd, entry.customer, &customer, &pos)) {
+                customer.balance = entry.balance_before;
+                if (write_at(ufd, pos, &customer, sizeof customer) && fsync(ufd) == 0) {
+                    entry.state = 3; (void)write_at(jfd, 0, &entry, sizeof entry); (void)fsync(jfd);
+                }
+            }
+            unlock_file(ufd); close(ufd);
+        }
+    }
+    unlock_file(jfd); close(jfd);
+}
 static void recover_prepared_loan_credit(void) {
     int jfd = db_open(LOAN_JOURNAL_FILE, O_RDWR|O_CREAT), ufd, lfd;
     LoanJournal entry; User applicant; Loan loan; off_t upos, lpos = 0;
@@ -162,12 +199,22 @@ static void bootstrap(void) {
     (void)db_open(LOANS_FILE,O_RDWR|O_CREAT); (void)db_open(TXNS_FILE,O_RDWR|O_CREAT); (void)db_open(FEEDBACK_FILE,O_RDWR|O_CREAT);
     recover_prepared_transfer();
     recover_prepared_loan_credit();
+    recover_prepared_balance_change();
     return;
 bootstrap_failed:
     perror("write initial users"); unlock_file(fd); close(fd); exit(EXIT_FAILURE);
 }
 static int current_user(const char *username, User *out, off_t *pos) {
-    int fd=db_open(USERS_FILE,O_RDONLY);int found=0;if(fd>=0){lock_file(fd,F_RDLCK);found=find_user_fd(fd,username,out,pos);unlock_file(fd);close(fd);}return found;
+    int fd=db_open(USERS_FILE,O_RDONLY);int found=0;off_t found_pos=0;
+    if(fd>=0){
+        lock_file(fd,F_RDLCK);
+        found=find_user_fd(fd,username,out,&found_pos);
+        if(found) (void)lock_record(fd,F_RDLCK,found_pos,sizeof(User));
+        if(pos)*pos=found_pos;
+        unlock_file(fd);
+        close(fd);
+    }
+    return found;
 }
 
 static void login(const Request *q, Response *r, char session[MAX_USERNAME], int *session_role) {
@@ -176,6 +223,7 @@ static void login(const Request *q, Response *r, char session[MAX_USERNAME], int
     if(*session){respond(r,0,"This connection already has a logged-in user.");return;}
     fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}
     if(!find_user_fd(fd,q->username,&u,&pos)){unlock_file(fd);close(fd);respond(r,0,"Invalid credentials.");return;}
+    if(lock_record(fd,F_WRLCK,pos,sizeof u)<0){unlock_file(fd);close(fd);respond(r,0,"Database unavailable.");return;}
     password_digest(q->password,u.salt,digest);
     if(strcmp(digest,u.password_hash)||u.role!=q->role){unlock_file(fd);close(fd);respond(r,0,"Invalid credentials or role.");return;}
     if(!u.active){unlock_file(fd);close(fd);respond(r,0,"Account is deactivated.");return;}
@@ -184,20 +232,34 @@ static void login(const Request *q, Response *r, char session[MAX_USERNAME], int
     unlock_file(fd);close(fd);snprintf(session,MAX_USERNAME,"%s",u.username);*session_role=u.role;r->balance=u.balance;respond(r,1,"Login successful. Welcome, %s.",u.full_name);
 }
 static void logout_session(char session[MAX_USERNAME]) {
-    int fd;User u;off_t pos;if(!session[0])return;fd=db_open(USERS_FILE,O_RDWR);if(fd>=0&&lock_file(fd,F_WRLCK)==0){if(find_user_fd(fd,session,&u,&pos)){u.logged_in=0;write_at(fd,pos,&u,sizeof u);fsync(fd);}unlock_file(fd);close(fd);}session[0]=0;
+    int fd;User u;off_t pos;if(!session[0])return;fd=db_open(USERS_FILE,O_RDWR);if(fd>=0&&lock_file(fd,F_WRLCK)==0){if(find_user_fd(fd,session,&u,&pos)){(void)lock_record(fd,F_WRLCK,pos,sizeof u);u.logged_in=0;write_at(fd,pos,&u,sizeof u);fsync(fd);}unlock_file(fd);close(fd);}session[0]=0;
 }
 static void balance(const char *session, Response *r) { User u;if(!current_user(session,&u,NULL)){respond(r,0,"Account not found.");return;}r->balance=u.balance;respond(r,1,"Current balance: %.2f",u.balance); }
-static void deposit(const char *session,const Request *q,Response *r) {
-    int fd;User u;off_t pos;if(!valid_amount(q->amount)){respond(r,0,"Amount must be positive.");return;}sem_wait(write_gate);fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);sem_post(write_gate);respond(r,0,"Database unavailable.");return;}if(!find_user_fd(fd,session,&u,&pos)||!u.active){unlock_file(fd);close(fd);sem_post(write_gate);respond(r,0,"Account is unavailable.");return;}append_journal("BEGIN_DEPOSIT",session,q->amount,"customer deposit");u.balance+=q->amount;int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;unlock_file(fd);close(fd);if(good)append_transaction(session,"DEPOSIT",q->amount,u.balance,"-");sem_post(write_gate);r->balance=u.balance;respond(r,good,"Deposit %s. Balance: %.2f",good?"completed":"failed",u.balance);
+static void change_balance(const char *session, const Request *q, Response *r, int withdrawal) {
+    int fd, good = 0; User u; off_t pos; BalanceJournal entry;
+    if (!valid_amount(q->amount)) { respond(r,0,"Amount must be positive."); return; }
+    sem_wait(write_gate); fd=db_open(USERS_FILE,O_RDWR);
+    if (fd<0 || lock_file(fd,F_WRLCK)<0) { if(fd>=0)close(fd); sem_post(write_gate); respond(r,0,"Database unavailable."); return; }
+    if (!find_user_fd(fd,session,&u,&pos) || !u.active || lock_record(fd,F_WRLCK,pos,sizeof u)<0) { unlock_file(fd); close(fd); sem_post(write_gate); respond(r,0,"Account is unavailable."); return; }
+    if (withdrawal && u.balance < q->amount) { unlock_file(fd); close(fd); sem_post(write_gate); respond(r,0,"Insufficient balance."); return; }
+    memset(&entry, 0, sizeof entry); entry.epoch=time(NULL); entry.amount=q->amount; entry.balance_before=u.balance;
+    snprintf(entry.customer,sizeof entry.customer,"%s",session); snprintf(entry.kind,sizeof entry.kind,"%s",withdrawal?"WITHDRAW":"DEPOSIT");
+    if (write_balance_journal(&entry,1) == 0) {
+        u.balance += withdrawal ? -q->amount : q->amount;
+        good = write_at(fd,pos,&u,sizeof u) && fsync(fd)==0 && write_balance_journal(&entry,2)==0;
+        if (!good) { u.balance=entry.balance_before; (void)write_at(fd,pos,&u,sizeof u); (void)fsync(fd); (void)write_balance_journal(&entry,3); }
+    }
+    unlock_file(fd); close(fd);
+    if (good) { (void)append_transaction(session,entry.kind,q->amount,u.balance,"-"); append_journal(withdrawal?"COMMIT_WITHDRAW":"COMMIT_DEPOSIT",session,q->amount,"customer balance change"); }
+    sem_post(write_gate); r->balance=u.balance; respond(r,good,"%s %s. Balance: %.2f",withdrawal?"Withdrawal":"Deposit",good?"completed":"failed",u.balance);
 }
-static void withdraw_money(const char *session,const Request *q,Response *r) {
-    int fd;User u;off_t pos;if(!valid_amount(q->amount)){respond(r,0,"Amount must be positive.");return;}sem_wait(write_gate);fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);sem_post(write_gate);respond(r,0,"Database unavailable.");return;}if(!find_user_fd(fd,session,&u,&pos)||!u.active){unlock_file(fd);close(fd);sem_post(write_gate);respond(r,0,"Account is unavailable.");return;}if(u.balance<q->amount){unlock_file(fd);close(fd);sem_post(write_gate);respond(r,0,"Insufficient balance.");return;}append_journal("BEGIN_WITHDRAW",session,q->amount,"customer withdrawal");u.balance-=q->amount;int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;unlock_file(fd);close(fd);if(good)append_transaction(session,"WITHDRAW",q->amount,u.balance,"-");sem_post(write_gate);r->balance=u.balance;respond(r,good,"Withdrawal %s. Balance: %.2f",good?"completed":"failed",u.balance);
-}
+static void deposit(const char *session,const Request *q,Response *r) { change_balance(session,q,r,0); }
+static void withdraw_money(const char *session,const Request *q,Response *r) { change_balance(session,q,r,1); }
 static void transfer(const char *session,const Request *q,Response *r) {
     int fd;User from,to;off_t fp,tp;TransferJournal entry;
     if(!valid_amount(q->amount)||!valid_text(q->target,MAX_USERNAME)||!strcmp(session,q->target)){respond(r,0,"Provide a different recipient and a positive amount.");return;}
     sem_wait(write_gate);fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);sem_post(write_gate);respond(r,0,"Database unavailable.");return;}
-    if(!find_user_fd(fd,session,&from,&fp)||!find_user_fd(fd,q->target,&to,&tp)||from.role!=ROLE_CUSTOMER||to.role!=ROLE_CUSTOMER||!from.active||!to.active){unlock_file(fd);close(fd);sem_post(write_gate);respond(r,0,"Both active customer accounts are required.");return;}
+    if(!find_user_fd(fd,session,&from,&fp)||!find_user_fd(fd,q->target,&to,&tp)||lock_record(fd,F_WRLCK,fp,sizeof from)<0||lock_record(fd,F_WRLCK,tp,sizeof to)<0||from.role!=ROLE_CUSTOMER||to.role!=ROLE_CUSTOMER||!from.active||!to.active){unlock_file(fd);close(fd);sem_post(write_gate);respond(r,0,"Both active customer accounts are required.");return;}
     if(from.balance<q->amount){unlock_file(fd);close(fd);sem_post(write_gate);respond(r,0,"Insufficient balance.");return;}
     memset(&entry, 0, sizeof entry); entry.epoch=time(NULL); entry.amount=q->amount; entry.from_before=from.balance; entry.to_before=to.balance; snprintf(entry.from,sizeof entry.from,"%s",session); snprintf(entry.to,sizeof entry.to,"%s",q->target);
     if (write_transfer_journal(&entry, 1) != 0) { unlock_file(fd); close(fd); sem_post(write_gate); respond(r,0,"Could not prepare durable transfer."); return; }
@@ -210,21 +272,37 @@ static void apply_loan(const char *session,const Request *q,Response *r) {
     int fd;Loan loan;off_t end;if(!valid_amount(q->amount)){respond(r,0,"Loan amount must be positive.");return;}fd=db_open(LOANS_FILE,O_RDWR|O_CREAT);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Loan database unavailable.");return;}end=lseek(fd,0,SEEK_END);memset(&loan,0,sizeof loan);loan.id=(int32_t)(end/(off_t)sizeof loan+1);snprintf(loan.applicant,sizeof loan.applicant,"%s",session);loan.amount=q->amount;loan.status=0;snprintf(loan.note,sizeof loan.note,"%s",q->text[0]?q->text:"Pending review");int good=write(fd,&loan,sizeof loan)==(ssize_t)sizeof loan&&fsync(fd)==0;unlock_file(fd);close(fd);if(good)append_journal("LOAN_APPLIED",session,q->amount,"pending");respond(r,good,good?"Loan application #%d submitted.":"Could not submit loan.",loan.id);
 }
 static void change_password(const char *session,const Request *q,Response *r) {
-    int fd;User u;off_t pos;if(!valid_text(q->password,MAX_PASSWORD)){respond(r,0,"New password is required.");return;}fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}if(!find_user_fd(fd,session,&u,&pos)){unlock_file(fd);close(fd);respond(r,0,"Account unavailable.");return;}make_salt(u.salt,u.username);password_digest(q->password,u.salt,u.password_hash);int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"Password changed.":"Password change failed.");
+    int fd;User u;off_t pos;if(!valid_text(q->password,MAX_PASSWORD)){respond(r,0,"New password is required.");return;}fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}if(!find_user_fd(fd,session,&u,&pos)||lock_record(fd,F_WRLCK,pos,sizeof u)<0){unlock_file(fd);close(fd);respond(r,0,"Account unavailable.");return;}make_salt(u.salt,u.username);password_digest(q->password,u.salt,u.password_hash);int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"Password changed.":"Password change failed.");
 }
 static void add_feedback(const char *session,const Request *q,Response *r) { int fd;Feedback f;off_t end;if(!valid_text(q->text,MAX_TEXT)){respond(r,0,"Feedback cannot be empty.");return;}fd=db_open(FEEDBACK_FILE,O_RDWR|O_CREAT);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Feedback storage unavailable.");return;}end=lseek(fd,0,SEEK_END);memset(&f,0,sizeof f);f.id=(int32_t)(end/(off_t)sizeof f+1);snprintf(f.customer,sizeof f.customer,"%s",session);snprintf(f.text,sizeof f.text,"%s",q->text);f.epoch=time(NULL);int good=write(fd,&f,sizeof f)==(ssize_t)sizeof f&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"Feedback recorded.":"Feedback could not be recorded."); }
 static void history(const char *username,Response *r) { int fd=db_open(TXNS_FILE,O_RDONLY|O_CREAT);Transaction t;size_t used=0;if(fd<0||lock_file(fd,F_RDLCK)<0){if(fd>=0)close(fd);respond(r,0,"Transaction database unavailable.");return;}while(read(fd,&t,sizeof t)==(ssize_t)sizeof t)if(!strncmp(t.customer,username,MAX_USERNAME)){int n=snprintf(r->data+used,sizeof r->data-used,"#%d %-13s %10.2f balance %10.2f other %s at %lld\n",t.id,t.kind,t.amount,t.balance_after,t.counterparty,(long long)t.epoch);if(n<0||(size_t)n>=sizeof r->data-used)break;used+=(size_t)n;}unlock_file(fd);close(fd);respond(r,1,used?"Transaction history returned.":"No transactions yet."); }
 
-static void add_person(const Request *q,Response *r,int role) { int fd;User u;if(!valid_text(q->username,MAX_USERNAME)||!valid_text(q->password,MAX_PASSWORD)||!valid_text(q->text,MAX_TEXT)){respond(r,0,"Username, password, and full name are required.");return;}fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}if(find_user_fd(fd,q->username,NULL,NULL)){unlock_file(fd);close(fd);respond(r,0,"Username already exists.");return;}new_user(&u,q->username,q->password,q->text,role,role==ROLE_CUSTOMER?q->amount:0);int good=write(fd,&u,sizeof u)==(ssize_t)sizeof u&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"%s account created.":"Account creation failed.",role_name(role)); }
-static void modify_user(const Request *q,Response *r,int allow_role) { int fd;User u;off_t pos;if(!valid_text(q->target,MAX_USERNAME)){respond(r,0,"Target username is required.");return;}fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}if(!find_user_fd(fd,q->target,&u,&pos)){unlock_file(fd);close(fd);respond(r,0,"Target user not found.");return;}if(q->text[0])snprintf(u.full_name,sizeof u.full_name,"%.*s",MAX_NAME-1,q->text);if(q->amount>=0&&u.role==ROLE_CUSTOMER)u.balance=q->amount;if(allow_role&&q->role>=ROLE_CUSTOMER&&q->role<=ROLE_ADMIN)u.role=q->role;int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"User details updated.":"Update failed."); }
-static void set_account_active(const Request *q,Response *r) { int fd;User u;off_t pos;if(!valid_text(q->target,MAX_USERNAME)){respond(r,0,"Customer username is required.");return;}fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}if(!find_user_fd(fd,q->target,&u,&pos)||u.role!=ROLE_CUSTOMER){unlock_file(fd);close(fd);respond(r,0,"Customer not found.");return;}u.active=q->id?1:0;if(!u.active)u.logged_in=0;int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"Customer account %s.":"Account update failed.",q->id?"activated":"deactivated"); }
+static void add_person(const Request *q,Response *r,int role) { int fd;User u;if(!valid_text(q->username,MAX_USERNAME)||!valid_text(q->password,MAX_PASSWORD)||!valid_text(q->text,MAX_TEXT)){respond(r,0,"Username, password, and full name are required.");return;}if(role==ROLE_CUSTOMER&&(q->amount<0||q->amount>=1000000000.0)){respond(r,0,"Opening balance must be zero or a valid positive amount.");return;}fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}if(find_user_fd(fd,q->username,NULL,NULL)){unlock_file(fd);close(fd);respond(r,0,"Username already exists.");return;}new_user(&u,q->username,q->password,q->text,role,role==ROLE_CUSTOMER?q->amount:0);int good=write(fd,&u,sizeof u)==(ssize_t)sizeof u&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"%s account created.":"Account creation failed.",role_name(role)); }
+static void modify_user(const Request *q,Response *r,int allow_role) { int fd;User u;off_t pos;if(!valid_text(q->target,MAX_USERNAME)){respond(r,0,"Target username is required.");return;}fd=db_open(USERS_FILE,O_RDWR);if(fd<0||lock_file(fd,F_WRLCK)<0){if(fd>=0)close(fd);respond(r,0,"Database unavailable.");return;}if(!find_user_fd(fd,q->target,&u,&pos)||lock_record(fd,F_WRLCK,pos,sizeof u)<0){unlock_file(fd);close(fd);respond(r,0,"Target user not found.");return;}if(q->text[0])snprintf(u.full_name,sizeof u.full_name,"%.*s",MAX_NAME-1,q->text);if(q->amount>=0&&u.role==ROLE_CUSTOMER)u.balance=q->amount;if(allow_role&&q->role>=ROLE_CUSTOMER&&q->role<=ROLE_ADMIN)u.role=q->role;int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;unlock_file(fd);close(fd);respond(r,good,good?"User details updated.":"Update failed."); }
+/* Administrators may manage customer, employee, and manager accounts. Never disable an administrator here. */
+static void set_user_active(const Request *q, Response *r, int customer_only) {
+    int fd; User u; off_t pos;
+    if (!valid_text(q->target,MAX_USERNAME)) { respond(r,0,customer_only?"Customer username is required.":"Username is required."); return; }
+    fd=db_open(USERS_FILE,O_RDWR);
+    if (fd<0 || lock_file(fd,F_WRLCK)<0) { if(fd>=0)close(fd); respond(r,0,"Database unavailable."); return; }
+    if (!find_user_fd(fd,q->target,&u,&pos) || lock_record(fd,F_WRLCK,pos,sizeof u)<0 ||
+        (customer_only && u.role!=ROLE_CUSTOMER) || (!customer_only && u.role==ROLE_ADMIN)) {
+        unlock_file(fd); close(fd); respond(r,0,customer_only?"Customer not found.":"Customer, employee, or manager not found."); return;
+    }
+    u.active=q->id?1:0;
+    if (!u.active) u.logged_in=0; /* forces logout of an already connected user */
+    int good=write_at(fd,pos,&u,sizeof u)&&fsync(fd)==0;
+    unlock_file(fd); close(fd);
+    respond(r,good,good?"%s account %s.":"Account update failed.",role_name(u.role),q->id?"activated":"deactivated");
+}
+static void set_account_active(const Request *q,Response *r) { set_user_active(q,r,1); }
 static void close_customer(const Request *q, Response *r) {
     Request deactivate = *q;
     deactivate.id = 0;
     set_account_active(&deactivate, r);
     if (r->ok) snprintf(r->message, sizeof r->message, "Customer account closed (deactivated).");
 }
-static void assign_loan(const Request *q,Response *r) { int lfd,ufd;Loan loan;User e;off_t pos=0;if(q->id<=0||!valid_text(q->target,MAX_USERNAME)){respond(r,0,"Loan id and employee username are required.");return;}ufd=db_open(USERS_FILE,O_RDONLY);if(ufd<0||lock_file(ufd,F_RDLCK)<0){if(ufd>=0)close(ufd);respond(r,0,"User database unavailable.");return;}int employee=find_user_fd(ufd,q->target,&e,NULL)&&e.role==ROLE_EMPLOYEE&&e.active;unlock_file(ufd);close(ufd);if(!employee){respond(r,0,"Active employee not found.");return;}lfd=db_open(LOANS_FILE,O_RDWR);if(lfd<0||lock_file(lfd,F_WRLCK)<0){if(lfd>=0)close(lfd);respond(r,0,"Loan database unavailable.");return;}while(read_at(lfd,pos,&loan,sizeof loan)){if(loan.id==q->id)break;pos+=sizeof loan;}if(loan.id!=q->id||loan.status){unlock_file(lfd);close(lfd);respond(r,0,"Pending loan not found.");return;}snprintf(loan.assigned_to,sizeof loan.assigned_to,"%s",q->target);int good=write_at(lfd,pos,&loan,sizeof loan)&&fsync(lfd)==0;unlock_file(lfd);close(lfd);respond(r,good,good?"Loan assigned.":"Loan assignment failed."); }
+static void assign_loan(const Request *q,Response *r) { int lfd,ufd;Loan loan;User e;off_t pos=0;if(q->id<=0||!valid_text(q->target,MAX_USERNAME)){respond(r,0,"Loan id and employee username are required.");return;}pthread_mutex_lock(&loan_assignment_gate);ufd=db_open(USERS_FILE,O_RDONLY);if(ufd<0||lock_file(ufd,F_RDLCK)<0){if(ufd>=0)close(ufd);pthread_mutex_unlock(&loan_assignment_gate);respond(r,0,"User database unavailable.");return;}int employee=find_user_fd(ufd,q->target,&e,NULL)&&e.role==ROLE_EMPLOYEE&&e.active;unlock_file(ufd);close(ufd);if(!employee){pthread_mutex_unlock(&loan_assignment_gate);respond(r,0,"Active employee not found.");return;}lfd=db_open(LOANS_FILE,O_RDWR);if(lfd<0||lock_file(lfd,F_WRLCK)<0){if(lfd>=0)close(lfd);pthread_mutex_unlock(&loan_assignment_gate);respond(r,0,"Loan database unavailable.");return;}while(read_at(lfd,pos,&loan,sizeof loan)){if(loan.id==q->id)break;pos+=sizeof loan;}if(loan.id!=q->id||lock_record(lfd,F_WRLCK,pos,sizeof loan)<0||loan.status||loan.assigned_to[0]){unlock_file(lfd);close(lfd);pthread_mutex_unlock(&loan_assignment_gate);respond(r,0,"Loan is not available for assignment.");return;}snprintf(loan.assigned_to,sizeof loan.assigned_to,"%s",q->target);int good=write_at(lfd,pos,&loan,sizeof loan)&&fsync(lfd)==0;unlock_file(lfd);close(lfd);pthread_mutex_unlock(&loan_assignment_gate);respond(r,good,good?"Loan assigned.":"Loan assignment failed."); }
 static void assigned_loans(const char *session,Response *r) { int fd=db_open(LOANS_FILE,O_RDONLY|O_CREAT);Loan loan;size_t used=0;if(fd<0||lock_file(fd,F_RDLCK)<0){if(fd>=0)close(fd);respond(r,0,"Loan database unavailable.");return;}while(read(fd,&loan,sizeof loan)==(ssize_t)sizeof loan)if(!strncmp(loan.assigned_to,session,MAX_USERNAME)){int n=snprintf(r->data+used,sizeof r->data-used,"#%d applicant=%s amount=%.2f status=%s note=%s\n",loan.id,loan.applicant,loan.amount,loan.status==0?"PENDING":loan.status==1?"APPROVED":"REJECTED",loan.note);if(n<0||(size_t)n>=sizeof r->data-used)break;used+=(size_t)n;}unlock_file(fd);close(fd);respond(r,1,used?"Assigned loans returned.":"No assigned loans."); }
 static void pending_loans(Response *r) { int fd=db_open(LOANS_FILE,O_RDONLY|O_CREAT);Loan loan;size_t used=0;if(fd<0||lock_file(fd,F_RDLCK)<0){if(fd>=0)close(fd);respond(r,0,"Loan database unavailable.");return;}while(read(fd,&loan,sizeof loan)==(ssize_t)sizeof loan)if(loan.status==0){int n=snprintf(r->data+used,sizeof r->data-used,"#%d applicant=%s amount=%.2f assigned=%s note=%s\n",loan.id,loan.applicant,loan.amount,loan.assigned_to[0]?loan.assigned_to:"UNASSIGNED",loan.note);if(n<0||(size_t)n>=sizeof r->data-used)break;used+=(size_t)n;}unlock_file(fd);close(fd);respond(r,1,used?"Pending loan applications returned.":"No pending loan applications."); }
 static void my_loans(const char *customer, Response *r) { int fd=db_open(LOANS_FILE,O_RDONLY|O_CREAT);Loan loan;size_t used=0;if(fd<0||lock_file(fd,F_RDLCK)<0){if(fd>=0)close(fd);respond(r,0,"Loan database unavailable.");return;}while(read(fd,&loan,sizeof loan)==(ssize_t)sizeof loan)if(!strncmp(loan.applicant,customer,MAX_USERNAME)){int n=snprintf(r->data+used,sizeof r->data-used,"#%d amount=%.2f status=%s assigned=%s note=%s\n",loan.id,loan.amount,loan.status==0?"PENDING":loan.status==1?"APPROVED":"REJECTED",loan.assigned_to[0]?loan.assigned_to:"UNASSIGNED",loan.note);if(n<0||(size_t)n>=sizeof r->data-used)break;used+=(size_t)n;}unlock_file(fd);close(fd);respond(r,1,used?"Loan status returned.":"No loan applications yet."); }
@@ -234,18 +312,28 @@ static void loan_decision(const char *employee,const Request *q,Response *r) { i
     if(q->amount==1&&(!good||write_loan_journal(&entry,2)!=0)){applicant.balance=entry.balance_before;(void)write_at(ufd,upos,&applicant,sizeof applicant);(void)fsync(ufd);loan.status=0;(void)write_at(fd,pos,&loan,sizeof loan);(void)fsync(fd);(void)write_loan_journal(&entry,3);good=0;}
     if(ufd>=0){unlock_file(ufd);close(ufd);}unlock_file(fd);close(fd);if(good&&q->amount==1)append_transaction(loan.applicant,"LOAN_CREDIT",loan.amount,applicant.balance,"BANK");respond(r,good,good?(q->amount==1?"Loan approved and credited to customer account.":"Loan rejected."):"Loan decision failed."); }
 static void list_feedback(Response *r) { int fd=db_open(FEEDBACK_FILE,O_RDONLY|O_CREAT);Feedback f;size_t used=0;if(fd<0||lock_file(fd,F_RDLCK)<0){if(fd>=0)close(fd);respond(r,0,"Feedback storage unavailable.");return;}while(read(fd,&f,sizeof f)==(ssize_t)sizeof f){int n=snprintf(r->data+used,sizeof r->data-used,"#%d %s at %lld: %s\n",f.id,f.customer,(long long)f.epoch,f.text);if(n<0||(size_t)n>=sizeof r->data-used)break;used+=(size_t)n;}unlock_file(fd);close(fd);respond(r,1,used?"Feedback returned.":"No feedback yet."); }
+static void list_employees(Response *r) { int fd=db_open(USERS_FILE,O_RDONLY); User u; size_t used=0; if(fd<0||lock_file(fd,F_RDLCK)<0){if(fd>=0)close(fd);respond(r,0,"User database unavailable.");return;} while(read(fd,&u,sizeof u)==(ssize_t)sizeof u) if(u.role==ROLE_EMPLOYEE){int n=snprintf(r->data+used,sizeof r->data-used,"%s | %s | %s\n",u.username,u.full_name,u.active?"ACTIVE":"INACTIVE");if(n<0||(size_t)n>=sizeof r->data-used)break;used+=(size_t)n;} unlock_file(fd);close(fd);respond(r,1,used?"Employee list returned.":"No employees found."); }
+
+/* Revalidate every request: an administrator/employee deactivation invalidates an open customer socket immediately. */
+static int ensure_session_active(char session[MAX_USERNAME], int *session_role, Response *r) {
+    User u;
+    if (!current_user(session,&u,NULL) || !u.active || !u.logged_in || u.role != *session_role) {
+        session[0]=0; *session_role=0; respond(r,0,"Your session has ended because the account is unavailable."); return 0;
+    }
+    return 1;
+}
 
 static void handle_request(const Request *q,Response *r,char session[MAX_USERNAME],int *session_role) {
-    blank(r);if(q->operation==OP_LOGIN){login(q,r,session,session_role);return;}if(!session[0]){respond(r,0,"Please log in first.");return;}if(q->operation==OP_LOGOUT||q->operation==OP_EXIT){logout_session(session);*session_role=0;respond(r,1,"Logged out.");return;}if(q->operation==OP_CHANGE_PASSWORD){change_password(session,q,r);return;}
+    blank(r);if(q->operation==OP_LOGIN){login(q,r,session,session_role);return;}if(!session[0]){respond(r,0,"Please log in first.");return;}if(q->operation==OP_LOGOUT||q->operation==OP_EXIT){logout_session(session);*session_role=0;respond(r,1,"Logged out.");return;}if(!ensure_session_active(session,session_role,r))return;if(q->operation==OP_CHANGE_PASSWORD){change_password(session,q,r);return;}
     switch(*session_role) {
     case ROLE_CUSTOMER:
         if(q->operation==OP_BALANCE)balance(session,r);else if(q->operation==OP_DEPOSIT)deposit(session,q,r);else if(q->operation==OP_WITHDRAW)withdraw_money(session,q,r);else if(q->operation==OP_TRANSFER)transfer(session,q,r);else if(q->operation==OP_APPLY_LOAN)apply_loan(session,q,r);else if(q->operation==OP_FEEDBACK)add_feedback(session,q,r);else if(q->operation==OP_HISTORY)history(session,r);else if(q->operation==OP_LIST_MY_LOANS)my_loans(session,r);else respond(r,0,"Operation not permitted for customer.");break;
     case ROLE_EMPLOYEE:
         if(q->operation==OP_ADD_CUSTOMER)add_person(q,r,ROLE_CUSTOMER);else if(q->operation==OP_MODIFY_USER)modify_user(q,r,0);else if(q->operation==OP_CLOSE_ACCOUNT)close_customer(q,r);else if(q->operation==OP_LOAN_DECISION)loan_decision(session,q,r);else if(q->operation==OP_LIST_ASSIGNED_LOANS)assigned_loans(session,r);else if(q->operation==OP_CUSTOMER_HISTORY){if(valid_text(q->target,MAX_USERNAME))history(q->target,r);else respond(r,0,"Customer username required.");}else respond(r,0,"Operation not permitted for employee.");break;
     case ROLE_MANAGER:
-        if(q->operation==OP_ACCOUNT_STATE)set_account_active(q,r);else if(q->operation==OP_ASSIGN_LOAN)assign_loan(q,r);else if(q->operation==OP_LIST_PENDING_LOANS)pending_loans(r);else if(q->operation==OP_LIST_FEEDBACK)list_feedback(r);else respond(r,0,"Operation not permitted for manager.");break;
+        if(q->operation==OP_ACCOUNT_STATE)set_account_active(q,r);else if(q->operation==OP_ASSIGN_LOAN)assign_loan(q,r);else if(q->operation==OP_LIST_PENDING_LOANS)pending_loans(r);else if(q->operation==OP_LIST_FEEDBACK)list_feedback(r);else if(q->operation==OP_LIST_EMPLOYEES)list_employees(r);else respond(r,0,"Operation not permitted for manager.");break;
     case ROLE_ADMIN:
-        if(q->operation==OP_ADD_EMPLOYEE)add_person(q,r,ROLE_EMPLOYEE);else if(q->operation==OP_MODIFY_USER)modify_user(q,r,0);else if(q->operation==OP_SET_ROLE)modify_user(q,r,1);else respond(r,0,"Operation not permitted for administrator.");break;
+        if(q->operation==OP_ADD_CUSTOMER)add_person(q,r,ROLE_CUSTOMER);else if(q->operation==OP_ADD_EMPLOYEE)add_person(q,r,ROLE_EMPLOYEE);else if(q->operation==OP_ADD_MANAGER)add_person(q,r,ROLE_MANAGER);else if(q->operation==OP_ACCOUNT_STATE)set_user_active(q,r,0);else if(q->operation==OP_MODIFY_USER)modify_user(q,r,0);else if(q->operation==OP_SET_ROLE)modify_user(q,r,1);else respond(r,0,"Operation not permitted for administrator.");break;
     default: respond(r,0,"Invalid session role.");
     }
 }

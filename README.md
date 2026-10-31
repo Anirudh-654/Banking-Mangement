@@ -29,15 +29,15 @@ Change all default passwords before a demonstration. Passwords are SHA-256 diges
 
 - Customer: one-session login, balance, deposit, withdrawal, transfer, loan application, loan-status tracking, password change, feedback, transaction history, logout, and exit. An approved loan is credited to the customer's balance and passbook.
 - Employee: one-session login, open, modify, and close customer accounts, view and decide assigned loans, customer passbook/history, password change, logout, and exit.
-- Manager: one-session login, activate/deactivate customer accounts, view pending loan application IDs, assign pending loans to employees, review feedback, password change, logout, and exit.
-- Administrator: one-session login, create employees, modify customer/employee details, change user roles, password change, logout, and exit.
+- Manager: one-session login, activate/deactivate customer accounts, view the employee directory and pending loan application IDs, atomically assign an unassigned pending loan to an employee, review feedback, password change, logout, and exit.
+- Administrator: one-session login, create customers, employees, and managers; activate/deactivate customer, employee, and manager accounts; modify user details; change user roles; password change, logout, and exit.
 
 ## Concurrency and persistence
 
 - A detached POSIX thread serves each client; several clients may connect at once.
-- `fcntl(F_SETLKW)` advisory locks protect every database read/write operation across processes.
+- `fcntl(F_SETLKW)` advisory locks protect database reads/writes across processes, with fixed-record byte-range locking available for individual records. Server-side synchronization additionally serializes competing in-process loan assignments.
 - A named POSIX semaphore coordinates balance-changing operations in the running server.
 - Transfers prepare a durable rollback record, update both customers in one locked `users.dat` write path, call `fsync`, and mark the transfer committed. On startup, a prepared-but-uncommitted transfer is rolled back before clients are accepted; committed transfers produce passbook records for both parties.
-- All append and update mutation paths call `fsync`. Loan disbursement uses the same prepare/commit/recovery approach as transfers. Persistent data remains in `users.dat`, `loans.dat`, `transactions.dat`, `feedback.dat`, and journal files.
+- All append and update mutation paths call `fsync`. Deposits, withdrawals, transfers, and loan disbursements use durable prepare/commit recovery journals. Persistent data remains in `users.dat`, `loans.dat`, `transactions.dat`, `feedback.dat`, and journal files. Every request revalidates the session, so deactivating a customer invalidates their open connection before its next operation.
 
 The protocol deliberately uses fixed-size C records, so the client and server must be compiled from the same source revision and run on compatible Linux architectures.
